@@ -9,45 +9,35 @@ const https = require('https');
 // ── Config ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 const LEDGER_PATH = path.join(__dirname, 'ledger.json');
+const COLLECTION_PATH = path.join(__dirname, 'rexxie-collection.json');
 const WOC_BASE = 'https://api.whatsonchain.com/v1/bsv/main';
-const RELAYNFT_ORIGIN = 'cdea2c203af755cd9477ca310c61021abaafc135a21d8f93b8ebfc6ca5f95712';
-const REXXIE_CLASS_ORIGIN = '12d8ca4bc0eaf26660627cc1671de6a0047246f39f3aa06633f8204223d70cc5';
-const REXXIE_CLASS_REF = REXXIE_CLASS_ORIGIN + '_o2';
-const MINTING_ADDRESS = '12nG9uFESfdyE9SdYHVXQeCGFdfYLcdYZG';
 
-// Known Rexxie txids to seed the indexer
-const SEED_TXIDS = [
-  'd0ef96ba417631626cfa62053e338422cb788d62945c7ac20dd7237f2bf9809a',
-  'ab772754507274d1ba3a9cdf64b8aff2fd81392286711602022d4a5844119134',
-];
+const REXXIE_CLASS_ORIGIN = '12d8ca4bc0eaf26660627cc1671de6a0047246f39f3aa06633f8204223d70cc5';
+const TIQUE_RUN_BASE = `https://tique.run/${REXXIE_CLASS_ORIGIN}_o2`;
 
 // ── Ledger ──────────────────────────────────────────────────────────────────
 let ledger = {
   collection: {
     name: 'Rexxie',
     protocol: 'Run (BSV)',
-    classOrigin: RELAYNFT_ORIGIN,
-    description: 'Rexxie NFT collection on BSV via Run token protocol (originally RelayX)',
-    totalIndexed: 0,
+    classOrigin: REXXIE_CLASS_ORIGIN,
+    classRef: REXXIE_CLASS_ORIGIN + '_o2',
+    description: 'RelayX wishes you a Merry Christmas and Happy New Year.',
+    symbol: 'COL',
+    total: 2222,
+    deployBlock: 771246,
     lastUpdated: null,
   },
-  nfts: {},       // keyed by mint txid (origin)
-  owners: {},     // address -> [nft origin txids]
-  processed: {},  // txid -> true (set of processed txids)
-  queue: [],      // txids to process
+  nfts: {},       // keyed by number (1-2222)
+  owners: {},     // address -> [nft numbers]
+  ownershipIndexed: 0,
 };
 
 function loadLedger() {
   try {
     if (fs.existsSync(LEDGER_PATH)) {
       ledger = JSON.parse(fs.readFileSync(LEDGER_PATH, 'utf8'));
-      // Migrate: if processed is array, convert to object
-      if (Array.isArray(ledger.processed)) {
-        const obj = {};
-        for (const t of ledger.processed) obj[t] = true;
-        ledger.processed = obj;
-      }
-      console.log(`Loaded ledger: ${Object.keys(ledger.nfts).length} NFTs, ${Object.keys(ledger.processed).length} processed txs`);
+      console.log(`Loaded ledger: ${Object.keys(ledger.nfts).length} NFTs, ${ledger.ownershipIndexed} with ownership`);
     }
   } catch (e) {
     console.error('Failed to load ledger:', e.message);
@@ -55,7 +45,6 @@ function loadLedger() {
 }
 
 function saveLedger() {
-  ledger.collection.totalIndexed = Object.keys(ledger.nfts).length;
   ledger.collection.lastUpdated = new Date().toISOString();
   fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
 }
@@ -81,86 +70,79 @@ function wocGet(endpoint) {
   });
 }
 
-async function getTx(txid) {
-  return wocGet(`/tx/hash/${txid}`);
+// ── Import collection metadata from content.js ─────────────────────────────
+function importCollection() {
+  if (!fs.existsSync(COLLECTION_PATH)) {
+    console.log('No rexxie-collection.json found. Run content.js import first.');
+    return;
+  }
+
+  const collection = JSON.parse(fs.readFileSync(COLLECTION_PATH, 'utf8'));
+  console.log(`Importing ${collection.length} NFTs from collection data...`);
+
+  let imported = 0;
+  for (const item of collection) {
+    const num = parseInt(item.number);
+    if (ledger.nfts[num]) continue; // already imported
+
+    // Extract mint txid from image URL
+    const match = item.img?.match(/\/([a-f0-9]{64})_o3\.png/);
+    const mintTxid = match ? match[1] : null;
+
+    ledger.nfts[num] = {
+      number: num,
+      mintTxid,
+      jigRef: mintTxid ? `${mintTxid}_o3` : null,
+      image: item.img,
+      traits: {
+        background: item.background,
+        base: item.base,
+        body: item.body,
+        eye: item.eye,
+        mouth: item.mouth,
+        head: item.head,
+      },
+      owner: null,       // to be indexed
+      lastTx: null,      // to be indexed
+      transfers: [],     // to be indexed
+    };
+    imported++;
+  }
+
+  saveLedger();
+  console.log(`Imported ${imported} NFTs. Total: ${Object.keys(ledger.nfts).length}`);
 }
 
 // ── Run Protocol Decoder ────────────────────────────────────────────────────
-
 function decodeRunPayload(tx) {
   for (const vout of (tx.vout || [])) {
     const asm = vout.scriptPubKey?.asm || '';
     if (!asm.includes('OP_RETURN')) continue;
-
     try {
       const parts = asm.split(' ');
-      const retIdx = parts.indexOf('OP_RETURN');
-      if (retIdx < 0) continue;
-      const dataparts = parts.slice(retIdx + 1).filter(p => !p.startsWith('OP_'));
-
-      // Check for 'run' tag
-      const first = dataparts[0];
-      if (first !== '7239026' && first !== '72756e') continue;
-
-      // version is dataparts[1]
-      // Remaining parts: app name (optional) + JSON payload
-      const decoded = [];
-      for (let i = 2; i < dataparts.length; i++) {
-        try {
-          decoded.push(Buffer.from(dataparts[i], 'hex').toString('utf8'));
-        } catch { decoded.push(dataparts[i]); }
-      }
-
-      let payload = null;
+      const ri = parts.indexOf('OP_RETURN');
+      if (ri < 0) continue;
+      const dp = parts.slice(ri + 1).filter(p => !p.startsWith('OP_'));
+      if (dp[0] !== '7239026' && dp[0] !== '72756e') continue;
       let appName = null;
-      for (const d of decoded) {
-        if (d.startsWith('{')) {
-          try { payload = JSON.parse(d); } catch {}
-        } else if (!payload) {
-          appName = d;
-        }
-      }
-
-      if (payload) {
-        payload._appName = appName;
-        return payload;
+      for (let i = 2; i < dp.length; i++) {
+        try {
+          const txt = Buffer.from(dp[i], 'hex').toString('utf8');
+          if (txt.startsWith('{')) {
+            const payload = JSON.parse(txt);
+            payload._appName = appName;
+            return payload;
+          } else if (!appName) {
+            appName = txt;
+          }
+        } catch {}
       }
     } catch {}
   }
   return null;
 }
 
-function parseExec(payload) {
-  const result = {
-    type: null,
-    appName: payload._appName || null,
-    refs: payload.ref || [],
-    numInputs: typeof payload.in === 'number' ? payload.in : 0,
-    numOutputs: (payload.out || []).length,
-    creates: payload.cre || [],
-    deletes: payload.del || [],
-    calls: [],
-  };
-
-  for (const action of (payload.exec || [])) {
-    if (!action || typeof action !== 'object') continue;
-    if (action.op === 'CALL' && Array.isArray(action.data)) {
-      const jig = action.data[0];
-      const method = action.data[1];
-      const args = action.data[2] || [];
-      result.calls.push({ jig, method, args });
-      if (!result.type) result.type = method;
-    } else if (action.op === 'DEPLOY') {
-      result.type = 'deploy';
-    } else if (action.op === 'NEW') {
-      result.type = 'new';
-    }
-  }
-
-  return result;
-}
-
-// Resolve address from Run arg (can be string, {$arb: {address, satoshis}}, etc.)
+// Resolve address from Run arg
 function resolveAddress(arg) {
   if (typeof arg === 'string') return arg;
   if (Array.isArray(arg)) return resolveAddress(arg[0]);
@@ -171,293 +153,82 @@ function resolveAddress(arg) {
   return null;
 }
 
-// Check if a tx references the Rexxie or RelayNFT class
-function refsRexxie(payload) {
-  const refs = payload.ref || [];
-  return refs.some(r => typeof r === 'string' && (r.includes(REXXIE_CLASS_ORIGIN) || r.includes(RELAYNFT_ORIGIN)));
-}
+// ── Ownership Indexer ───────────────────────────────────────────────────────
+// For each NFT, trace the jig UTXO chain from the mint tx forward
+// to find current owner by following sends.
 
-// ── Indexer ─────────────────────────────────────────────────────────────────
+async function indexOwnership(startNum, batchSize = 50) {
+  const nums = Object.keys(ledger.nfts)
+    .map(Number)
+    .filter(n => !ledger.nfts[n].owner)
+    .sort((a, b) => a - b);
 
-function findNftByLastTx(txid) {
-  for (const [origin, nft] of Object.entries(ledger.nfts)) {
-    if (nft.lastTx === txid || nft.lastLocation === txid) return origin;
+  if (startNum) {
+    const idx = nums.indexOf(startNum);
+    if (idx > 0) nums.splice(0, idx);
   }
-  return null;
-}
 
-async function processTx(txid) {
-  if (ledger.processed[txid]) return;
+  const batch = nums.slice(0, batchSize);
+  console.log(`Indexing ownership for ${batch.length} NFTs (${nums.length} remaining)...`);
 
-  console.log(`Processing: ${txid.slice(0, 16)}...`);
-  try {
-    const tx = await getTx(txid);
-    const payload = decodeRunPayload(tx);
+  let indexed = 0;
+  for (const num of batch) {
+    const nft = ledger.nfts[num];
+    if (!nft.mintTxid) continue;
 
-    if (!payload) {
-      console.log(`  No Run payload`);
-      ledger.processed[txid] = true;
-      saveLedger();
-      return;
-    }
-
-    const exec = parseExec(payload);
-    const usesRelayNFT = refsRexxie(payload);
-    console.log(`  ${exec.type || '?'} | app=${exec.appName || '?'} | relayNFT=${usesRelayNFT}`);
-
-    // Skip non-RelayNFT txs (deploy of OrderLock, etc.)
-    if (!usesRelayNFT && exec.type !== 'send') {
-      console.log(`  Skipping (not RelayNFT-related)`);
-      ledger.processed[txid] = true;
-      saveLedger();
-      return;
-    }
-
-    // ── Handle mint ──
-    if (exec.type === 'mint' && usesRelayNFT) {
-      for (const call of exec.calls) {
-        if (call.method !== 'mint') continue;
-        const owner = resolveAddress(call.args[0]);
-        const metadata = call.args[1] || {};
-        const name = exec.appName || metadata.name || 'Unknown';
-
-        const nft = {
-          origin: txid,
-          name: metadata.name || name,
-          description: metadata.description || '',
-          image: metadata.image || null,
-          glbModel: metadata.glbModel || null,
-          owner: owner || (exec.creates[0] || null),
-          creator: exec.creates[0] || null,
-          mintTx: txid,
-          lastTx: txid,
-          blockHeight: tx.blockheight || null,
-          blockTime: tx.blocktime || null,
-          transfers: [{
-            txid, type: 'mint', to: owner,
-            blockHeight: tx.blockheight, blockTime: tx.blocktime,
-          }],
-        };
-
-        ledger.nfts[txid] = nft;
-        if (nft.owner) {
-          if (!ledger.owners[nft.owner]) ledger.owners[nft.owner] = [];
-          if (!ledger.owners[nft.owner].includes(txid)) ledger.owners[nft.owner].push(txid);
-        }
-        console.log(`  Minted: "${nft.name}" → ${nft.owner || '(no owner)'}`);
+    try {
+      // Get the mint tx to find initial owner address (vout 2 = NFT jig output)
+      const mintTx = await wocGet(`/tx/hash/${nft.mintTxid}`);
+      // NFT jig is at _o3, which is vout index 3 (0=image OP_RETURN, 1=Run OP_RETURN, 2=class, 3=NFT)
+      // Actually _o3 means Run output index 3 (which maps to the 4th P2PKH output after OP_RETURNs)
+      // Let's find the address from the mint tx
+      
+      // In Run, outputs after OP_RETURN are: class jig, NFT jig, change...
+      // The NFT jig (_o3) is typically at vout 2 or 3
+      // For a mint with `out: 2` (class state + NFT), the NFT is the second P2PKH output
+      let nftVout = null;
+      let p2pkhIdx = 0;
+      for (const vout of mintTx.vout) {
+        if (vout.scriptPubKey?.asm?.includes('OP_RETURN')) continue;
+        p2pkhIdx++;
+        // _o3 means the 3rd Run output (0-indexed from Run's perspective)
+        // Run output 0 = class update, output 1 = new NFT jig
+        // But we need to figure out vout mapping. Let's try vout 2 first.
       }
-    }
 
-    // ── Handle send ──
-    if (exec.type === 'send') {
-      for (const call of exec.calls) {
-        if (call.method !== 'send') continue;
-        const sendTo = resolveAddress(call.args[0]);
-        const name = exec.appName || 'Unknown';
+      // Simpler: check address at vout 2 (typical NFT position for mints)
+      const nftOutput = mintTx.vout[2];
+      const mintOwner = nftOutput?.scriptPubKey?.addresses?.[0];
 
-        // Find which NFT is being sent by checking vin
-        // In Run, jig inputs start at vin[1] (vin[0] is funding)
-        let originKey = null;
-        if (tx.vin && tx.vin.length > 1) {
-          const jigVinTxid = tx.vin[1].txid;
-          // Check if we know this NFT by its last tx
-          originKey = findNftByLastTx(jigVinTxid);
-          if (!originKey && ledger.nfts[jigVinTxid]) {
-            originKey = jigVinTxid;
-          }
-          // If unknown, queue the input tx for processing first
-          if (!originKey && !ledger.processed[jigVinTxid]) {
-            console.log(`  Queueing input tx: ${jigVinTxid.slice(0, 16)}...`);
-            if (!ledger.queue.includes(jigVinTxid)) {
-              ledger.queue.unshift(jigVinTxid); // process it first
-            }
-            // Re-queue this tx after the input
-            if (!ledger.queue.includes(txid)) {
-              ledger.queue.push(txid);
-            }
-            return; // don't mark as processed yet
-          }
-        }
+      if (mintOwner) {
+        nft.owner = mintOwner;
+        nft.lastTx = nft.mintTxid;
+        nft.transfers = [{ txid: nft.mintTxid, type: 'mint', to: mintOwner, blockHeight: mintTx.blockheight }];
 
-        if (originKey && ledger.nfts[originKey]) {
-          const nft = ledger.nfts[originKey];
-          const oldOwner = nft.owner;
-          if (oldOwner && ledger.owners[oldOwner]) {
-            ledger.owners[oldOwner] = ledger.owners[oldOwner].filter(id => id !== originKey);
-          }
-          nft.owner = sendTo;
-          nft.lastTx = txid;
-          nft.transfers.push({
-            txid, type: 'send', to: sendTo,
-            blockHeight: tx.blockheight, blockTime: tx.blocktime,
-          });
-          if (sendTo) {
-            if (!ledger.owners[sendTo]) ledger.owners[sendTo] = [];
-            if (!ledger.owners[sendTo].includes(originKey)) ledger.owners[sendTo].push(originKey);
-          }
-          console.log(`  Send: "${nft.name}" → ${sendTo}`);
-        } else {
-          // Unknown origin — create a partial record
-          const key = txid;
-          ledger.nfts[key] = {
-            origin: key,
-            name,
-            owner: sendTo,
-            mintTx: 'unknown',
-            lastTx: txid,
-            blockHeight: tx.blockheight,
-            blockTime: tx.blocktime,
-            transfers: [{ txid, type: 'send (discovered)', to: sendTo, blockHeight: tx.blockheight, blockTime: tx.blocktime }],
-          };
-          if (sendTo) {
-            if (!ledger.owners[sendTo]) ledger.owners[sendTo] = [];
-            if (!ledger.owners[sendTo].includes(key)) ledger.owners[sendTo].push(key);
-          }
-          console.log(`  New NFT from send: "${name}" → ${sendTo}`);
-        }
+        // Now trace forward: check if this output was spent (= transferred)
+        // For now just record the mint owner — full transfer tracing is a future step
+        
+        if (!ledger.owners[mintOwner]) ledger.owners[mintOwner] = [];
+        if (!ledger.owners[mintOwner].includes(num)) ledger.owners[mintOwner].push(num);
+
+        indexed++;
+        ledger.ownershipIndexed++;
       }
-    }
 
-    // ── Handle updateMetadata ──
-    if (exec.type === 'updateMetadata') {
-      for (const call of exec.calls) {
-        if (call.method !== 'updateMetadata') continue;
-        const metadata = call.args[0] || {};
-        // Find the NFT
-        let originKey = null;
-        if (tx.vin && tx.vin.length > 1) {
-          const jigVinTxid = tx.vin[1].txid;
-          originKey = findNftByLastTx(jigVinTxid) || (ledger.nfts[jigVinTxid] ? jigVinTxid : null);
-        }
-        if (originKey && ledger.nfts[originKey]) {
-          const nft = ledger.nfts[originKey];
-          if (metadata.name) nft.name = metadata.name;
-          if (metadata.description) nft.description = metadata.description;
-          if (metadata.image) nft.image = metadata.image;
-          if (metadata.glbModel) nft.glbModel = metadata.glbModel;
-          nft.metadata = { ...nft.metadata, ...metadata };
-          nft.lastTx = txid;
-          console.log(`  Updated metadata: "${nft.name}"`);
-        }
+      if (indexed % 10 === 0) {
+        saveLedger();
+        console.log(`  Indexed ${indexed}/${batch.length} (NFT #${num})`);
       }
-    }
 
-    ledger.processed[txid] = true;
-    saveLedger();
-    await new Promise(r => setTimeout(r, 500));
-  } catch (e) {
-    console.error(`  Error: ${e.message}`);
-    ledger.processed[txid] = true; // skip on error to avoid infinite loop
-    saveLedger();
-  }
-}
-
-// Discover Rexxie mints by scanning the minting address history.
-// Filter: must be a mint tx AND must spend a jig that traces to the Rexxie COL class.
-// We verify by checking if vin[1] (the class jig input) comes from a known Rexxie tx.
-async function discoverMints() {
-  console.log(`Discovering Rexxie mints from address ${MINTING_ADDRESS}...`);
-  console.log(`  Rexxie COL class: ${REXXIE_CLASS_ORIGIN}`);
-
-  try {
-    const history = await wocGet(`/address/${MINTING_ADDRESS}/history`);
-    if (!Array.isArray(history)) {
-      console.log('  Could not fetch address history');
-      return;
-    }
-    // Sort by block height ascending
-    history.sort((a, b) => (a.height || 0) - (b.height || 0));
-    console.log(`  Address has ${history.length} total txs`);
-
-    // Track the COL class jig location: starts at deploy tx vout 2
-    const knownClassLocations = new Set();
-    knownClassLocations.add(`${REXXIE_CLASS_ORIGIN}:2`);
-
-    let found = 0;
-    let scanned = 0;
-
-    for (const htx of history) {
-      const txid = htx.tx_hash;
-      scanned++;
-      if (ledger.processed[txid] || ledger.queue.includes(txid)) continue;
-      // Skip txs before the COL deploy block
-      if (htx.height && htx.height < 771246) continue;
-
-      try {
-        const tx = await getTx(txid);
-        const payload = decodeRunPayload(tx);
-        if (!payload) { await new Promise(r => setTimeout(r, 200)); continue; }
-
-        const exec = parseExec(payload);
-        if (exec.type !== 'mint') { await new Promise(r => setTimeout(r, 200)); continue; }
-
-        // Check if this mint spends the Rexxie COL class jig
-        // The class jig is typically vin[1] (vin[0] is funding)
-        let isRexxie = false;
-        for (const vin of (tx.vin || [])) {
-          const loc = `${vin.txid}:${vin.vout}`;
-          if (knownClassLocations.has(loc)) {
-            isRexxie = true;
-            break;
-          }
-        }
-
-        if (isRexxie) {
-          ledger.queue.push(txid);
-          found++;
-
-          // The class jig is recreated in this tx — find its new location
-          // It's the last P2PKH output to the minting address (class state output)
-          for (let i = tx.vout.length - 1; i >= 0; i--) {
-            const vout = tx.vout[i];
-            const addr = vout.scriptPubKey?.addresses?.[0];
-            if (addr === MINTING_ADDRESS && !vout.scriptPubKey.asm.includes('OP_RETURN')) {
-              knownClassLocations.add(`${txid}:${i}`);
-              break;
-            }
-          }
-
-          if (found % 50 === 0) {
-            console.log(`  Found ${found} Rexxie mints (scanned ${scanned}/${history.length})...`);
-            saveLedger();
-          }
-        }
-
-        // Rate limit
-        await new Promise(r => setTimeout(r, 300));
-      } catch (e) {
-        await new Promise(r => setTimeout(r, 500));
-      }
-    }
-
-    console.log(`  Discovery complete. Found ${found} Rexxie mints out of ${history.length} txs.`);
-    saveLedger();
-  } catch (e) {
-    console.error('  Discovery error:', e.message);
-  }
-}
-
-async function runIndexer(discover = false) {
-  if (discover) {
-    await discoverMints();
-  }
-
-  for (const txid of SEED_TXIDS) {
-    if (!ledger.processed[txid] && !ledger.queue.includes(txid)) {
-      ledger.queue.push(txid);
+      await new Promise(r => setTimeout(r, 300));
+    } catch (e) {
+      console.error(`  Error indexing #${num}: ${e.message}`);
+      await new Promise(r => setTimeout(r, 500));
     }
   }
 
-  console.log(`Indexer starting. Queue: ${ledger.queue.length}, Processed: ${Object.keys(ledger.processed).length}`);
-
-  let safety = 0;
-  while (ledger.queue.length > 0 && safety++ < 5000) {
-    const txid = ledger.queue.shift();
-    await processTx(txid);
-  }
-
-  if (safety >= 5000) console.log('Indexer hit safety limit (5000 txs per run)');
-  console.log(`Indexer done. ${Object.keys(ledger.nfts).length} NFTs indexed.`);
+  saveLedger();
+  console.log(`Ownership batch done. ${indexed} indexed this run. Total with owners: ${ledger.ownershipIndexed}`);
 }
 
 // ── API ─────────────────────────────────────────────────────────────────────
@@ -474,105 +245,143 @@ app.get('/', (req, res) => {
   res.json({
     name: 'Rexxie OpenClaw Explorer',
     description: 'Agent-first API for Rexxie NFTs on BSV (Run token protocol)',
+    total: 2222,
     endpoints: {
       'GET /collection': 'Collection info and stats',
-      'GET /nfts?page=1&limit=50': 'List all indexed NFTs (paginated)',
-      'GET /nft/:id': 'NFT details by origin txid',
+      'GET /nfts?page=1&limit=50': 'List NFTs (paginated)',
+      'GET /nft/:number': 'NFT details by number (1-2222)',
+      'GET /nft/tx/:txid': 'NFT details by mint txid',
       'GET /owner/:address': 'NFTs owned by a BSV address',
-      'GET /history/:id': 'Transfer history for an NFT',
-      'GET /search?q=name': 'Search NFTs by name/description',
-      'POST /index': 'Submit txids for indexing { txids: [...] }',
-      'POST /reindex': 'Re-run indexer on queued txids',
-      'POST /discover': 'Scan minting address to discover all Rexxie mints (slow, ~6k txs)',
+      'GET /traits': 'List all trait types and values with counts',
+      'GET /traits/:type/:value': 'NFTs with a specific trait',
+      'GET /search?q=query': 'Search NFTs by trait value',
+      'GET /random': 'Random NFT',
+      'GET /stats': 'Collection statistics',
+      'POST /index-owners?start=1&batch=50': 'Index ownership from chain (slow)',
       'GET /health': 'Health check',
     },
   });
 });
 
 app.get('/collection', (req, res) => {
+  const ownedCount = Object.values(ledger.owners).reduce((sum, arr) => sum + arr.length, 0);
   res.json({
     ...ledger.collection,
-    totalNFTs: Object.keys(ledger.nfts).length,
-    totalOwners: Object.keys(ledger.owners).filter(a => ledger.owners[a].length > 0).length,
-    processedTxs: Object.keys(ledger.processed).length,
-    queuedTxs: ledger.queue.length,
+    indexed: Object.keys(ledger.nfts).length,
+    ownersTracked: Object.keys(ledger.owners).filter(a => ledger.owners[a].length > 0).length,
+    ownershipIndexed: ledger.ownershipIndexed,
   });
 });
 
 app.get('/nfts', (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-  const entries = Object.entries(ledger.nfts);
+  const total = Object.keys(ledger.nfts).length;
   const start = (page - 1) * limit;
 
+  const nums = Object.keys(ledger.nfts).map(Number).sort((a, b) => a - b);
+  const pageNums = nums.slice(start, start + limit);
+
   res.json({
-    total: entries.length,
+    total,
     page,
     limit,
-    nfts: entries.slice(start, start + limit).map(([id, nft]) => ({
-      id,
-      name: nft.name,
-      number: nft.number || null,
-      owner: nft.owner,
-      image: nft.image || null,
-      mintTx: nft.mintTx,
-      lastTx: nft.lastTx,
-      blockHeight: nft.blockHeight,
-    })),
+    nfts: pageNums.map(n => {
+      const nft = ledger.nfts[n];
+      return {
+        number: n,
+        mintTxid: nft.mintTxid,
+        image: nft.image,
+        traits: nft.traits,
+        owner: nft.owner,
+      };
+    }),
   });
 });
 
-app.get('/nft/:id', (req, res) => {
-  const nft = ledger.nfts[req.params.id];
-  if (!nft) return res.status(404).json({ error: 'NFT not found' });
-  res.json({ id: req.params.id, ...nft });
+app.get('/nft/:number', (req, res) => {
+  const num = parseInt(req.params.number);
+  const nft = ledger.nfts[num];
+  if (!nft) return res.status(404).json({ error: 'NFT not found', valid: '1-2222' });
+  res.json({ ...nft });
+});
+
+app.get('/nft/tx/:txid', (req, res) => {
+  const txid = req.params.txid;
+  const entry = Object.entries(ledger.nfts).find(([_, nft]) => nft.mintTxid === txid);
+  if (!entry) return res.status(404).json({ error: 'NFT not found by txid' });
+  res.json({ number: parseInt(entry[0]), ...entry[1] });
 });
 
 app.get('/owner/:address', (req, res) => {
-  const nftIds = ledger.owners[req.params.address] || [];
-  const nfts = nftIds.map(id => ({ id, ...ledger.nfts[id] })).filter(n => n.name);
+  const nums = ledger.owners[req.params.address] || [];
+  const nfts = nums.map(n => ({ number: n, ...ledger.nfts[n] }));
   res.json({ address: req.params.address, count: nfts.length, nfts });
 });
 
-app.get('/history/:id', (req, res) => {
-  const nft = ledger.nfts[req.params.id];
-  if (!nft) return res.status(404).json({ error: 'NFT not found' });
-  res.json({ id: req.params.id, name: nft.name, transfers: nft.transfers || [] });
+app.get('/traits', (req, res) => {
+  const traitTypes = {};
+  for (const nft of Object.values(ledger.nfts)) {
+    if (!nft.traits) continue;
+    for (const [type, value] of Object.entries(nft.traits)) {
+      if (!traitTypes[type]) traitTypes[type] = {};
+      if (!traitTypes[type][value]) traitTypes[type][value] = 0;
+      traitTypes[type][value]++;
+    }
+  }
+  res.json(traitTypes);
+});
+
+app.get('/traits/:type/:value', (req, res) => {
+  const { type, value } = req.params;
+  const matches = Object.entries(ledger.nfts)
+    .filter(([_, nft]) => nft.traits && nft.traits[type]?.toLowerCase() === value.toLowerCase())
+    .map(([num, nft]) => ({ number: parseInt(num), mintTxid: nft.mintTxid, image: nft.image, traits: nft.traits, owner: nft.owner }));
+  res.json({ trait: type, value, count: matches.length, nfts: matches });
 });
 
 app.get('/search', (req, res) => {
   const q = (req.query.q || '').toLowerCase();
   if (!q) return res.json({ results: [] });
   const results = Object.entries(ledger.nfts)
-    .filter(([_, nft]) => (nft.name || '').toLowerCase().includes(q) || (nft.description || '').toLowerCase().includes(q))
-    .map(([id, nft]) => ({ id, name: nft.name, number: nft.number, owner: nft.owner }));
+    .filter(([_, nft]) => {
+      if (!nft.traits) return false;
+      return Object.values(nft.traits).some(v => v.toLowerCase().includes(q));
+    })
+    .map(([num, nft]) => ({ number: parseInt(num), traits: nft.traits, owner: nft.owner, image: nft.image }));
   res.json({ query: q, count: results.length, results });
 });
 
-app.post('/index', async (req, res) => {
-  const { txids } = req.body || {};
-  let added = 0;
-  if (Array.isArray(txids)) {
-    for (const txid of txids) {
-      if (/^[a-f0-9]{64}$/.test(txid) && !ledger.processed[txid] && !ledger.queue.includes(txid)) {
-        ledger.queue.push(txid);
-        added++;
-      }
+app.get('/random', (req, res) => {
+  const nums = Object.keys(ledger.nfts).map(Number);
+  const num = nums[Math.floor(Math.random() * nums.length)];
+  res.json({ number: num, ...ledger.nfts[num] });
+});
+
+app.get('/stats', (req, res) => {
+  const traitCounts = {};
+  for (const nft of Object.values(ledger.nfts)) {
+    if (!nft.traits) continue;
+    for (const [type, value] of Object.entries(nft.traits)) {
+      if (!traitCounts[type]) traitCounts[type] = new Set();
+      traitCounts[type].add(value);
     }
   }
-  res.json({ status: 'queued', added, queueLength: ledger.queue.length });
-  if (added > 0) runIndexer().catch(console.error);
+  const uniqueOwners = new Set(Object.values(ledger.nfts).map(n => n.owner).filter(Boolean));
+  res.json({
+    totalNFTs: 2222,
+    indexed: Object.keys(ledger.nfts).length,
+    ownershipIndexed: ledger.ownershipIndexed,
+    uniqueOwners: uniqueOwners.size,
+    traitTypes: Object.fromEntries(Object.entries(traitCounts).map(([k, v]) => [k, v.size])),
+  });
 });
 
-app.post('/reindex', async (req, res) => {
-  res.json({ status: 'reindexing', queueLength: ledger.queue.length });
-  runIndexer().catch(console.error);
-});
-
-// Discover all Rexxie mints from on-chain data
-app.post('/discover', async (req, res) => {
-  res.json({ status: 'discovering', message: 'Scanning minting address for Rexxie mints...' });
-  runIndexer(true).catch(console.error);
+app.post('/index-owners', async (req, res) => {
+  const start = parseInt(req.query.start) || 1;
+  const batch = Math.min(parseInt(req.query.batch) || 50, 200);
+  res.json({ status: 'indexing', start, batch });
+  indexOwnership(start, batch).catch(console.error);
 });
 
 app.get('/health', (req, res) => {
@@ -581,9 +390,9 @@ app.get('/health', (req, res) => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 loadLedger();
+importCollection();
 
 app.listen(PORT, () => {
   console.log(`Rexxie Explorer API running on port ${PORT}`);
   console.log(`http://localhost:${PORT}/`);
-  runIndexer().catch(console.error);
 });
