@@ -1,6 +1,9 @@
-# Rexxie NFT Explorer
+# Rexxie Indexer
 
-On-chain explorer for the **Rexxie** NFT collection on BSV (Bitcoin SV), built with the [Run protocol](https://run.network).
+On-chain indexer for the **Rexxie** NFT collection on BSV (Bitcoin SV), built with the [Run protocol](https://run.network).
+
+**Public API:** https://rexxie.axiemaid.com
+**Explorer Skill:** [rexxie-explorer-skill](https://github.com/axiemaid/rexxie-explorer-skill) — OpenClaw skill for agent-driven exploration
 
 ## Collection
 
@@ -16,8 +19,8 @@ On-chain explorer for the **Rexxie** NFT collection on BSV (Bitcoin SV), built w
 - ✅ Full ownership traced using orderlock-first logic
 - ✅ Incremental refresh with burn detection
 - ✅ 2,222 local images downloaded
-- ✅ API endpoints serving collection data
-- 🚧 Frontend UI (not yet built)
+- ✅ API endpoints serving collection data (public at rexxie.axiemaid.com)
+- ✅ OpenClaw skill for agent-driven exploration ([rexxie-explorer-skill](https://github.com/axiemaid/rexxie-explorer-skill))
 
 ## Architecture
 
